@@ -24,10 +24,13 @@ logger.setLevel(logging.INFO)
 
 
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+if not GOOGLE_API_KEY:
+    logger.error("GOOGLE_API_KEY is not set. Create a .env file next to this one with GOOGLE_API_KEY=<key>.")
 # Free-tier models. Pro is not available on the free tier, it returns 429 with limit 0.
-# The primary model gives the better answers; the fallback answers when the primary is overloaded (503).
-MODEL = os.getenv('GEMINI_MODEL', 'gemini-flash-latest')
-FALLBACK_MODEL = os.getenv('GEMINI_FALLBACK_MODEL', 'gemini-flash-lite-latest')
+# gemini-flash-latest answers better but has been returning 503 under load, so the lite model leads
+# and the better one is the fallback. Swap them with the env vars when the load eases.
+MODEL = os.getenv('GEMINI_MODEL', 'gemini-flash-lite-latest')
+FALLBACK_MODEL = os.getenv('GEMINI_FALLBACK_MODEL', 'gemini-flash-latest')
 # API endpoint URL
 URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}"
 # Headers for the request
@@ -40,8 +43,8 @@ GENERATION_CONFIG = {
     "thinkingConfig": {"thinkingLevel": "low"},
     "maxOutputTokens": 800,
 }
-PRIMARY_TIMEOUT_SECONDS = 3
-FALLBACK_TIMEOUT_SECONDS = 4
+PRIMARY_TIMEOUT_SECONDS = 5
+FALLBACK_TIMEOUT_SECONDS = 3
 # Conversation history sent to Gemini, rebuilt on every skill launch
 data = {
     "contents": []
@@ -55,6 +58,7 @@ LANGUAGE_STRINGS = {
         "ack": "Combinado!",
         "reprompt": "Mais alguma pergunta?",
         "no_answer": "Não recebi resposta para o seu pedido",
+        "not_understood": "Não entendi a sua pergunta. Pode repetir?",
         "help": "Você pode me perguntar qualquer coisa e eu respondo com a ajuda do Gemini. O que você quer saber?",
         "goodbye": "Até logo!",
         "error": "Desculpe, tive um problema ao fazer o que você pediu. Tente novamente.",
@@ -65,6 +69,7 @@ LANGUAGE_STRINGS = {
         "ack": "Understood!",
         "reprompt": "Any other questions?",
         "no_answer": "I did not receive a response to your request",
+        "not_understood": "I did not catch your question. Could you repeat it?",
         "help": "You can ask me anything and I will answer with the help of Gemini. What would you like to know?",
         "goodbye": "Goodbye!",
         "error": "Sorry, I had trouble doing what you asked. Please try again.",
@@ -172,6 +177,15 @@ class ChatIntentHandler(AbstractRequestHandler):
         # type: (HandlerInput) -> Response
         strings = get_strings(handler_input)
         query = handler_input.request_envelope.request.intent.slots["query"].value
+        if not query:
+            logger.warning("ChatIntent matched with an empty query slot")
+            return (
+                handler_input.response_builder
+                    .speak(strings["not_understood"])
+                    .ask(strings["reprompt"])
+                    .response
+            )
+
         text = ask_gemini(query)
         speak_output = text if text is not None else strings["no_answer"]
 
