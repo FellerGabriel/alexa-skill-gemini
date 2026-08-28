@@ -45,6 +45,11 @@ GENERATION_CONFIG = {
 }
 PRIMARY_TIMEOUT_SECONDS = 5
 FALLBACK_TIMEOUT_SECONDS = 3
+# While set, the skill says why a call failed out loud, so a failure can be diagnosed from the
+# simulator without opening CloudWatch. Set GEMINI_DEBUG=0 in .env once the skill works.
+DEBUG_ERRORS = os.getenv('GEMINI_DEBUG', '1') != '0'
+# Reason of the last failed call, spoken when DEBUG_ERRORS is on
+last_error = None
 # Conversation history sent to Gemini, rebuilt on every skill launch
 data = {
     "contents": []
@@ -91,6 +96,12 @@ def for_speech(text):
 
 def call_model(model, timeout):
     """POST the current history to one model. Returns the answer text, or None on failure."""
+    global last_error
+    if not GOOGLE_API_KEY:
+        last_error = "a chave da API não foi encontrada no arquivo .env"
+        logger.error("GOOGLE_API_KEY is empty, not calling %s", model)
+        return None
+
     payload = dict(data, generationConfig=GENERATION_CONFIG)
     try:
         response = requests.post(
@@ -99,11 +110,17 @@ def call_model(model, timeout):
             headers=headers,
             timeout=timeout,
         )
+    except requests.exceptions.Timeout:
+        last_error = "o modelo {} demorou mais de {} segundos".format(model, timeout)
+        logger.error("Request to %s timed out after %ss", model, timeout)
+        return None
     except requests.exceptions.RequestException as error:
+        last_error = "não consegui conectar na API do Gemini"
         logger.error("Request to %s failed: %s", model, error)
         return None
 
     if response.status_code != 200:
+        last_error = "o modelo {} respondeu erro {}".format(model, response.status_code)
         logger.error("Model %s returned %s: %s", model, response.status_code, response.text[:500])
         return None
 
@@ -187,7 +204,12 @@ class ChatIntentHandler(AbstractRequestHandler):
             )
 
         text = ask_gemini(query)
-        speak_output = text if text is not None else strings["no_answer"]
+        if text is not None:
+            speak_output = text
+        elif DEBUG_ERRORS and last_error:
+            speak_output = "Falhou porque " + last_error
+        else:
+            speak_output = strings["no_answer"]
 
         return (
             handler_input.response_builder
