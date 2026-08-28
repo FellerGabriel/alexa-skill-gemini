@@ -124,7 +124,13 @@ def call_model(model, timeout):
         logger.error("Model %s returned %s: %s", model, response.status_code, response.text[:500])
         return None
 
-    candidate = response.json().get("candidates", [{}])[0]
+    body = response.json()
+    # Identifies which model actually served the answer, straight from the API response
+    logger.info("Answered by %s, responseId %s, tokens %s",
+                body.get("modelVersion"),
+                body.get("responseId"),
+                body.get("usageMetadata", {}).get("totalTokenCount"))
+    candidate = body.get("candidates", [{}])[0]
     finish_reason = candidate.get("finishReason")
     if finish_reason not in (None, "STOP"):
         logger.warning("Model %s stopped with finishReason %s", model, finish_reason)
