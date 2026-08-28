@@ -29,15 +29,72 @@ url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-pr
 headers = {
     'Content-Type': 'application/json',
 }
-# Data (payload) to be sent in the POST request
+# Conversation history sent to Gemini, rebuilt on every skill launch
 data = {
-    "contents": [{
-        "role":"user",
-        "parts": [{
-            "text": ""
-        }]
-    }]
+    "contents": []
 }
+
+# Speech and prompts per language, keyed by the language part of the request locale
+LANGUAGE_STRINGS = {
+    "pt": {
+        "system_prompt": "Olá! Responda sempre em português do Brasil, de forma clara e sem ser prolixo. Combinado?",
+        "greeting": "Olá, eu sou seu assistente com o Gemini. ",
+        "greeting_suffix": " Como posso ajudar?",
+        "reprompt": "Mais alguma pergunta?",
+        "text_not_found": "Não encontrei uma resposta",
+        "request_error": "Erro na requisição",
+        "no_answer": "Não recebi resposta para o seu pedido",
+        "help": "Você pode me perguntar qualquer coisa e eu respondo com a ajuda do Gemini. O que você quer saber?",
+        "goodbye": "Até logo!",
+        "error": "Desculpe, tive um problema ao fazer o que você pediu. Tente novamente.",
+    },
+    "en": {
+        "system_prompt": "Hello! Respond in English clearly and do not be verbose. OK?",
+        "greeting": "Hello, I'm your Gemini Chat Bot. ",
+        "greeting_suffix": " How can I help you?",
+        "reprompt": "Any other questions?",
+        "text_not_found": "Text not found",
+        "request_error": "Request error",
+        "no_answer": "I did not receive a response to your request",
+        "help": "You can ask me anything and I will answer with the help of Gemini. What would you like to know?",
+        "goodbye": "Goodbye!",
+        "error": "Sorry, I had trouble doing what you asked. Please try again.",
+    },
+}
+
+
+def get_strings(handler_input):
+    """Return the speech strings matching the locale of the current request."""
+    locale = handler_input.request_envelope.request.locale or "en-US"
+    return LANGUAGE_STRINGS.get(locale.split("-")[0], LANGUAGE_STRINGS["en"])
+
+
+def ask_gemini(text, strings):
+    """Append the user turn, call Gemini and append the model turn. Returns the answer or None."""
+    data["contents"].append({
+        "role": "user",
+        "parts": [{
+            "text": text
+        }]
+    })
+    response = requests.post(url, json=data, headers=headers)
+    if response.status_code != 200:
+        logger.error("Gemini request failed: %s %s", response.status_code, response.text)
+        return None
+
+    response_data = response.json()
+    answer = (response_data.get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [{}])[0]
+        .get("text", strings["text_not_found"]))
+    data["contents"].append({
+        "role": "model",
+        "parts": [{
+            "text": answer
+        }]
+    })
+    return answer
+
 
 class LaunchRequestHandler(AbstractRequestHandler):
     """Handler for Skill Launch."""
@@ -48,25 +105,15 @@ class LaunchRequestHandler(AbstractRequestHandler):
 
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
-        data["contents"][0]["parts"][0]["text"] = "Hello! Respond in English clearly and do not be verbose. OK?"
-        response = requests.post(url, json=data, headers=headers)
-        if response.status_code == 200:
-            response_data = response.json()
-            text = (response_data.get("candidates", [{}])[0]
-                .get("content", {})
-                .get("parts", [{}])[0]
-                .get("text", "Text not found"))
-            speak_output = "Hello, I'm your Gemini Chat Bot. " + text + " How can I help you?"
-            response_text = {
-                "role": "model",
-                "parts": [{
-                    "text": text
-                }]
-            }
-            data["contents"].append(response_text)
+        strings = get_strings(handler_input)
+        # Start a fresh conversation so the language prompt of a previous session is not reused
+        data["contents"] = []
+        text = ask_gemini(strings["system_prompt"], strings)
+        if text is not None:
+            speak_output = strings["greeting"] + text + strings["greeting_suffix"]
         else:
-            speak_output = "Request error"
-            
+            speak_output = strings["request_error"]
+
         return (
             handler_input.response_builder
                 .speak(speak_output)
@@ -83,36 +130,33 @@ class ChatIntentHandler(AbstractRequestHandler):
 
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
+        strings = get_strings(handler_input)
         query = handler_input.request_envelope.request.intent.slots["query"].value
-        query_text = {
-                "role": "user",
-                "parts": [{
-                    "text": query
-                }]
-            }
-        data["contents"].append(query_text)
-        response = requests.post(url, json=data, headers=headers)
-        if response.status_code == 200:
-            response_data = response.json()
-            text = (response_data.get("candidates", [{}])[0]
-                .get("content", {})
-                .get("parts", [{}])[0]
-                .get("text", "Text not found"))
-            speak_output = text
-            response_text = {
-                "role": "model",
-                "parts": [{
-                    "text": text
-                }]
-            }
-            data["contents"].append(response_text)
-        else:
-            speak_output = "I did not receive a response to your request"
+        text = ask_gemini(query, strings)
+        speak_output = text if text is not None else strings["no_answer"]
 
         return (
             handler_input.response_builder
                 .speak(speak_output)
-                .ask("Any other questions?")
+                .ask(strings["reprompt"])
+                .response
+        )
+
+
+class HelpIntentHandler(AbstractRequestHandler):
+    """Handler for Help Intent."""
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return ask_utils.is_intent_name("AMAZON.HelpIntent")(handler_input)
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        strings = get_strings(handler_input)
+
+        return (
+            handler_input.response_builder
+                .speak(strings["help"])
+                .ask(strings["reprompt"])
                 .response
         )
 
@@ -126,7 +170,8 @@ class CancelOrStopIntentHandler(AbstractRequestHandler):
 
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
-        speak_output = "Goodbye!"
+        strings = get_strings(handler_input)
+        speak_output = strings["goodbye"]
 
         return (
             handler_input.response_builder
@@ -145,10 +190,10 @@ class CatchAllExceptionHandler(AbstractExceptionHandler):
         return True
 
     def handle(self, handler_input, exception):
-        # type: (HandlerInput, Exception) -> Response
+        # type: (HandlerInput) -> Response
         logger.error(exception, exc_info=True)
 
-        speak_output = "Sorry, I had trouble doing what you asked. Please try again."
+        speak_output = get_strings(handler_input)["error"]
 
         return (
             handler_input.response_builder
@@ -166,6 +211,7 @@ sb = SkillBuilder()
 
 sb.add_request_handler(LaunchRequestHandler())
 sb.add_request_handler(ChatIntentHandler())
+sb.add_request_handler(HelpIntentHandler())
 sb.add_request_handler(CancelOrStopIntentHandler())
 sb.add_exception_handler(CatchAllExceptionHandler())
 
