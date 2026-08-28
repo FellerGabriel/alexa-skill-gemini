@@ -5,6 +5,7 @@
 # session persistence, api calls, and more.
 # This sample is built using the handler classes approach in skill builder.
 import logging
+import re
 import ask_sdk_core.utils as ask_utils
 import requests
 import json
@@ -23,12 +24,24 @@ logger.setLevel(logging.INFO)
 
 
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+# Free-tier models. Pro is not available on the free tier, it returns 429 with limit 0.
+# The primary model gives the better answers; the fallback answers when the primary is overloaded (503).
+MODEL = os.getenv('GEMINI_MODEL', 'gemini-flash-latest')
+FALLBACK_MODEL = os.getenv('GEMINI_FALLBACK_MODEL', 'gemini-flash-lite-latest')
 # API endpoint URL
-url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key={}".format(GOOGLE_API_KEY)
+URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}"
 # Headers for the request
 headers = {
     'Content-Type': 'application/json',
 }
+# Alexa drops the response after about 8 seconds, so keep the thinking shallow and the timeouts tight.
+# maxOutputTokens also pays for the thinking tokens, so a tight budget truncates the answer mid-sentence.
+GENERATION_CONFIG = {
+    "thinkingConfig": {"thinkingLevel": "low"},
+    "maxOutputTokens": 800,
+}
+PRIMARY_TIMEOUT_SECONDS = 3
+FALLBACK_TIMEOUT_SECONDS = 4
 # Conversation history sent to Gemini, rebuilt on every skill launch
 data = {
     "contents": []
@@ -37,24 +50,20 @@ data = {
 # Speech and prompts per language, keyed by the language part of the request locale
 LANGUAGE_STRINGS = {
     "pt": {
-        "system_prompt": "Olá! Responda sempre em português do Brasil, de forma clara e sem ser prolixo. Combinado?",
-        "greeting": "Olá, eu sou seu assistente com o Gemini. ",
-        "greeting_suffix": " Como posso ajudar?",
+        "system_prompt": "Você é um assistente de voz na Alexa. Responda sempre em português do Brasil, em texto puro para ser falado em voz alta: sem markdown, sem listas numeradas, sem asteriscos e sem emojis. Seja claro e breve, no máximo três frases, a menos que peçam mais detalhes.",
+        "greeting": "Olá, eu sou seu assistente com o Gemini. Como posso ajudar?",
+        "ack": "Combinado!",
         "reprompt": "Mais alguma pergunta?",
-        "text_not_found": "Não encontrei uma resposta",
-        "request_error": "Erro na requisição",
         "no_answer": "Não recebi resposta para o seu pedido",
         "help": "Você pode me perguntar qualquer coisa e eu respondo com a ajuda do Gemini. O que você quer saber?",
         "goodbye": "Até logo!",
         "error": "Desculpe, tive um problema ao fazer o que você pediu. Tente novamente.",
     },
     "en": {
-        "system_prompt": "Hello! Respond in English clearly and do not be verbose. OK?",
-        "greeting": "Hello, I'm your Gemini Chat Bot. ",
-        "greeting_suffix": " How can I help you?",
+        "system_prompt": "You are a voice assistant on Alexa. Always answer in English, in plain text meant to be spoken out loud: no markdown, no numbered lists, no asterisks and no emojis. Be clear and brief, at most three sentences, unless more detail is requested.",
+        "greeting": "Hello, I'm your Gemini Chat Bot. How can I help you?",
+        "ack": "Understood!",
         "reprompt": "Any other questions?",
-        "text_not_found": "Text not found",
-        "request_error": "Request error",
         "no_answer": "I did not receive a response to your request",
         "help": "You can ask me anything and I will answer with the help of Gemini. What would you like to know?",
         "goodbye": "Goodbye!",
@@ -69,7 +78,40 @@ def get_strings(handler_input):
     return LANGUAGE_STRINGS.get(locale.split("-")[0], LANGUAGE_STRINGS["en"])
 
 
-def ask_gemini(text, strings):
+def for_speech(text):
+    """Strip markdown markers, which Alexa would otherwise read out loud."""
+    text = re.sub(r'[*_`#]+', '', text)
+    return re.sub(r'\s+\n', '\n', text).strip()
+
+
+def call_model(model, timeout):
+    """POST the current history to one model. Returns the answer text, or None on failure."""
+    payload = dict(data, generationConfig=GENERATION_CONFIG)
+    try:
+        response = requests.post(
+            URL_TEMPLATE.format(model, GOOGLE_API_KEY),
+            json=payload,
+            headers=headers,
+            timeout=timeout,
+        )
+    except requests.exceptions.RequestException as error:
+        logger.error("Request to %s failed: %s", model, error)
+        return None
+
+    if response.status_code != 200:
+        logger.error("Model %s returned %s: %s", model, response.status_code, response.text[:500])
+        return None
+
+    candidate = response.json().get("candidates", [{}])[0]
+    finish_reason = candidate.get("finishReason")
+    if finish_reason not in (None, "STOP"):
+        logger.warning("Model %s stopped with finishReason %s", model, finish_reason)
+    return (candidate.get("content", {})
+        .get("parts", [{}])[0]
+        .get("text"))
+
+
+def ask_gemini(text):
     """Append the user turn, call Gemini and append the model turn. Returns the answer or None."""
     data["contents"].append({
         "role": "user",
@@ -77,23 +119,21 @@ def ask_gemini(text, strings):
             "text": text
         }]
     })
-    response = requests.post(url, json=data, headers=headers)
-    if response.status_code != 200:
-        logger.error("Gemini request failed: %s %s", response.status_code, response.text)
+    answer = call_model(MODEL, PRIMARY_TIMEOUT_SECONDS)
+    if answer is None:
+        answer = call_model(FALLBACK_MODEL, FALLBACK_TIMEOUT_SECONDS)
+    if answer is None:
+        # Drop the unanswered turn so the next question is not sent with a dangling user message
+        data["contents"].pop()
         return None
 
-    response_data = response.json()
-    answer = (response_data.get("candidates", [{}])[0]
-        .get("content", {})
-        .get("parts", [{}])[0]
-        .get("text", strings["text_not_found"]))
     data["contents"].append({
         "role": "model",
         "parts": [{
             "text": answer
         }]
     })
-    return answer
+    return for_speech(answer)
 
 
 class LaunchRequestHandler(AbstractRequestHandler):
@@ -106,13 +146,13 @@ class LaunchRequestHandler(AbstractRequestHandler):
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
         strings = get_strings(handler_input)
-        # Start a fresh conversation so the language prompt of a previous session is not reused
-        data["contents"] = []
-        text = ask_gemini(strings["system_prompt"], strings)
-        if text is not None:
-            speak_output = strings["greeting"] + text + strings["greeting_suffix"]
-        else:
-            speak_output = strings["request_error"]
+        # Start a fresh conversation, seeded with the language instructions. The greeting is local:
+        # calling Gemini just to say hello made the launch fail whenever the API was unavailable.
+        data["contents"] = [
+            {"role": "user", "parts": [{"text": strings["system_prompt"]}]},
+            {"role": "model", "parts": [{"text": strings["ack"]}]},
+        ]
+        speak_output = strings["greeting"]
 
         return (
             handler_input.response_builder
@@ -132,7 +172,7 @@ class ChatIntentHandler(AbstractRequestHandler):
         # type: (HandlerInput) -> Response
         strings = get_strings(handler_input)
         query = handler_input.request_envelope.request.intent.slots["query"].value
-        text = ask_gemini(query, strings)
+        text = ask_gemini(query)
         speak_output = text if text is not None else strings["no_answer"]
 
         return (
